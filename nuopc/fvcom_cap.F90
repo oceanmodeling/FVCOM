@@ -26,7 +26,7 @@ module fvcom_cap
     model_label_Advance     => label_Advance,     &
     model_label_Finalize    => label_Finalize
 
-!JQI  USE MESSENGER, ONLY  : MPI_COMM_FVCOM,UPDATER
+!JQI  USE MESSENGER, ONLY  : MPI_COMM_FVCOM, UPDATER
 
   use NUOPC_FVCOM, only : NUOPC_FVCOM_init
   use NUOPC_FVCOM, only : NUOPC_FVCOM_run
@@ -36,10 +36,15 @@ module fvcom_cap
   use ALL_VARS   , only : WAVESTRX_2D, WAVESTRY_2D,WAVESTRX_3D,WAVESTRY_3D,nv
   use ALL_VARS   , only : U_STOKES_2D, V_STOKES_2D,U_STOKES_3D,V_STOKES_3D
   use ALL_VARS   , only : PAR, INTSTEP_SECONDS
-  use ALL_VARS   , only : UUWIND,VVWIND
+  use ALL_VARS   , only : UUWIND, VVWIND
+  USE ALL_VARS   , ONLY : E2N2D
+# if defined (AIR_PRESSURE) || (HEATING_CALCULATED)
+  USE ALL_VARS   , ONLY : PA_AIR
+# endif
   use MOD_PAR    , only : NBN,BN_MLT,BN_LOC,BNC,NODE_MATCH
   use MOD_PAR    , only : NC,EC,AEXCHANGE
   use MOD_PAR    , only : NMAP,MPI_F,MPI_FVCOM_GROUP,NGID_X,ACOLLECT
+  use MOD_PAR    , only : EMAP, EGID_X
   use LIMS       , only : MSRID
   use mod_prec   , only : SP
 
@@ -47,9 +52,6 @@ module fvcom_cap
   use mod_spherical, only : TPI,DEG2RAD,DELTUY
   use mod_driver , only : syear, smonth, sday, shour, sminute, ssecond
   use mod_driver , only : eyear, emonth, eday, ehour, eminute, esecond
-
-  use fvcom_mod, only: FVCOM_WHS,  FVCOM_WLEN, FVCOM_WDIR
-  use fvcom_mod, only: FVCOM_WVNX,  FVCOM_WVNY, FVCOM_PRN
 
   use fvcom_mod, only: NUOPC4WAV,NUOPC4MET
 
@@ -326,11 +328,9 @@ module fvcom_cap
       file=__FILE__)) &
       return  ! bail out
 
-!    print*, 'MPI_1 ',esmf_comm
     call MPI_Comm_dup(esmf_comm, fvcom_comm, ierr)
-!    print*, 'MPI_2 ',esmf_comm,fvcom_comm
-    fvcom_comm = esmf_comm
-!    print*, 'MPI_3 ',esmf_comm,fvcom_comm
+    !fvcom_comm = esmf_comm
+    !print*, 'MPI_3 ',esmf_comm,fvcom_comm
     ! Duplicate the MPI communicator not to interfere with ESMF communications.
     ! The duplicate MPI communicator can be used in any MPI call in the user
     ! code. Here the MPI_Barrier() routine is called.
@@ -885,8 +885,10 @@ module fvcom_cap
   !! @param rc return code
   !-----------------------------------------------------------------------------
   subroutine ModelAdvance(model, rc)
-  
+
     implicit none
+
+    ! input variables
     type(ESMF_GridComp)  :: model
     integer, intent(out) :: rc
 
@@ -895,9 +897,7 @@ module fvcom_cap
     type(ESMF_State)           :: importState, exportState
     type(ESMF_Time)            :: currTime
     type(ESMF_TimeInterval)    :: timeStep
-    character(len=*),parameter :: subname='(fvcom_cap:ModelAdvance)'
-    !tmp vector
-!    real(ESMF_KIND_R8), pointer:: tmp(:)
+
     real(ESMF_KIND_R8), ALLOCATABLE, TARGET :: tmp(:)
 
     ! exports
@@ -922,15 +922,10 @@ module fvcom_cap
     integer                    :: ITIME_BGN_FVCOM, ITIME_END_FVCOM
     integer                    :: nCplFVCOM
     real(ESMF_KIND_R8)         :: timeStepAbs
-    ! local variables for Get methods
-    integer :: YY, MM, DD, H, M, S
     integer :: ss,ssN,ssD
     integer :: j, k,ierr
     character*(ESMF_MAXSTR)    :: tmpShortName
-!JQI20230620    logical :: wave_forcing, meteo_forcing, surge_forcing
 
-    type(ESMF_Time) :: BeforeCaribbeanTime,AfterCaribbeanTime
-    
     real(ESMF_KIND_R8), allocatable :: unode(:),vnode(:)
     
     real(sp), allocatable :: TMP_WHS(:),TMP_WLEN(:),TMP_WDIR(:)
@@ -939,350 +934,178 @@ module fvcom_cap
 
     real(sp), allocatable :: TMP_WVNX(:),TMP_WVNY(:),TMP_PRN(:)
     real(sp), allocatable :: TMP1_WVNX(:),TMP1_WVNY(:),TMP1_PRN(:)
+    real(sp), parameter   :: missing_sp = -999.9_sp
+    character(len=*), parameter :: subname='(fvcom_cap:ModelAdvance)'
+    ! ----------------------------------------------
 
+    call ESMF_LogWrite(trim(subname)//": called", ESMF_LOGMSG_INFO)
     rc = ESMF_SUCCESS
     dbrc = ESMF_SUCCESS
-    ! query the Component for its clock, importState and exportState
+
+    ! Query the Component for its clock, importState and exportState
     call NUOPC_ModelGet(model, modelClock=clock, importState=importState, &
-      exportState=exportState, rc=rc)
+       exportState=exportState, rc=rc)
     if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
-      line=__LINE__, &
-      file=__FILE__)) &
-      return  ! bail out
+       line=__LINE__, &
+       file=__FILE__)) &
+       return  ! bail out
 
-    ! HERE THE MODEL ADVANCES: currTime -> currTime + timeStep
-    ! Because of the way that the internal Clock was set in SetClock(),
-    ! its timeStep is likely smaller than the parent timeStep. As a consequence
-    ! the time interval covered by a single parent timeStep will result in
-    ! multiple calls to the ModelAdvance() routine. Every time the currTime
-    ! will come in by one internal timeStep advanced. This goes until the
-    ! stopTime of the internal Clock has been reached.
-
-!    if(msr)then
+    ! Write current time 
     call ESMF_ClockPrint(clock, options="currTime", &
-      preString="------>Advancing FVCOM from: ", rc=rc)
+       preString="------>Advancing FVCOM from: ", rc=rc)
     if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
-      line=__LINE__, &
-      file=__FILE__)) &
-      return  ! bail out
-!    end if
+       line=__LINE__, &
+       file=__FILE__)) &
+       return  ! bail out
 
+    ! Query clock
     call ESMF_ClockGet(clock, currTime=currTime, timeStep=timeStep, rc=rc)
     if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
-      line=__LINE__, &
-      file=__FILE__)) &
-      return  ! bail out
+       line=__LINE__, &
+       file=__FILE__)) &
+       return  ! bail out
 
-!    if(msr)then
+    ! Write next time
     call ESMF_TimePrint(currTime + timeStep, &
-      preString="------------FVCOM---------------> to: ", rc=rc)
+       preString="------------FVCOM---------------> to: ", rc=rc)
+    if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
+       line=__LINE__, &
+       file=__FILE__)) &
+       return  ! bail out
+
+    ! Query time interval
+    call ESMF_TimeIntervalGet(timeStep, s=ss,sN=ssN,sD=ssD,rc=rc)
     if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
       line=__LINE__, &
       file=__FILE__)) &
       return  ! bail out
-!    end if
 
-    call ESMF_TimeGet(currTime, yy=YY, mm=MM, dd=DD, h=H, m=M, s=S, rc=rc)
-    if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
-      line=__LINE__, &
-      file=__FILE__)) &
-      return  ! bail out
+    ! Calculate time to run model 
+    timeStepAbs = real(ss)+real(ssN/ssD)
+    if (mod(timeStepAbs, IntStep_Seconds) == 0) then
+       nCplFVCOM = nint(timeStepAbs/IntStep_Seconds)
+    else
+       stop
+    endif
 
-    write(info, *)  "FVCOM currTime = ", YY, "/", MM, "/", DD," ", H, ":", M, ":", S
-!JQI    call allMessage(1,info)
-
+    ! Query time string that will be used to write states
     call ESMF_TimeGet(currTime, timeStringISOFrac=timeStr , rc=rc)
     if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
       line=__LINE__, &
       file=__FILE__)) &
       return  ! bail out
 
-    !global values for fvcom time step number
-!JQI    ITIME_BGN_FVCOM = ITHS + 1   !if hot start then ITHS>0
-!JQI    ITIME_END_FVCOM = NT         !NT is set in read_input.F
-
-    call ESMF_TimeIntervalGet(timeStep, s=ss,sN=ssN,sD=ssD,rc=rc)
-    if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
-      line=__LINE__, &
-      file=__FILE__)) &
-      return  ! bail out
-    timeStepAbs = real(ss) + real(ssN/ssD)
-!JQI    if (mod(timeStepAbs,DTDP) .EQ. 0) then
-!JQI      nCplFVCOM = nint(timeStepAbs/DTDP)
-!JQI    else
-!JQI      nCplFVCOM = nint(timeStepAbs/DTDP)+1
-!JQI    endif
-
-    if (mod(timeStepAbs,IntStep_Seconds) .EQ. 0) then
-      nCplFVCOM = nint(timeStepAbs/IntStep_Seconds)
-    else
-      STOP
-!JQI      nCplFVCOM = nint(timeStepAbs/DTDP)+1
-    endif
-
-
-!     print *, '  nCplFVCOM = ', nCplFVCOM
-!     print *, '  FVCOMCouplingTimeInterval = ', timeStepAbs
-!    print*, "STOP HERE?????????"
     !-----------------------------------------
-    !   IMPORT
+    ! Import from WAV
     !-----------------------------------------
-    !Get and fill imported fields
-    wave_forcing= .true.
-   
-    do num = 1,fldsToFvcom_num
 
-      if (fldsToFvcom(num)%shortname == 'wavhss') &
-         wave_forcing = wave_forcing .and. fldsToFvcom(num)%connected
-      if (fldsToFvcom(num)%shortname == 'wavlen') &
-         wave_forcing = wave_forcing .and. fldsToFvcom(num)%connected
-      if (fldsToFvcom(num)%shortname == 'wavdir') &
-         wave_forcing = wave_forcing .and. fldsToFvcom(num)%connected
-!      print*,"WAVE PARAMETER IS ",num, wave_forcing, fldsToFvcom(num)%connected
-    end do
+    ! Check for import fields
+    wave_forcing= .false. !.true.
+    !do num = 1,fldsToFvcom_num
+    !   if (fldsToFvcom(num)%shortname == 'wavhss') wave_forcing = wave_forcing .and. fldsToFvcom(num)%connected
+    !   if (fldsToFvcom(num)%shortname == 'wavlen') wave_forcing = wave_forcing .and. fldsToFvcom(num)%connected
+    !   if (fldsToFvcom(num)%shortname == 'wavdir') wave_forcing = wave_forcing .and. fldsToFvcom(num)%connected
+    !end do
 
-!    print*,"WAVE FORCING IS ",wave_forcing, fldsToFvcom(1)%connected
-!    print*,"SHORT NAME ",fldsToFvcom(1)%shortname,fldsToFvcom(2)%shortname,fldsToFvcom(3)%shortname
+    ! Get and fill imported wave model related fields
     if (wave_forcing) then
-    
-      ! Wave time step
-!JQI        RSTIMINC = nint(timeStepAbs)  !TODO: Get it from coupler based on the time slots.
-!JQI                                      !TODO: This implemetation wotks for one time slot for wind and wave right now.
-!JQI                                      !TODO: 
-!JQI        !RSTIMINC = fvcom_cpl_int +  fvcom_cpl_num / fvcom_cpl_den
-!JQI        !print *, ' in cap   ....> RSTIMINC > ', RSTIMINC
+       ! Significant wave height
+       call State_getFldPtr(ST=importState,fldname='wavhss',fldptr=dataPtr_wavhs,rc=rc)
+       if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
+          line=__LINE__, &
+          file=__FILE__)) &
+          return  ! bail out
 
-      !-----------------------------------------
-      ! <<<<< RECEIVE and UN-PACK WAVHSS
-
-      call State_getFldPtr_(ST=importState,fldname='wavhss',fldptr=dataPtr_wavhs, &
-                            dump=.true.,timeStr=timeStr,rc=rc)
-      if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
-        line=__LINE__, &
-        file=__FILE__)) &
-        return  ! bail out
-!      dataPtr_sxx3(:,k) =  dataPtr_tmp(:)
-!      print*,'3D size = ', size(dataPtr_tmp),size(FVCOM_SXX3,1),M,MT
+       write(info,'(A,3g14.7,i8)') trim(subname)//' import wavhss ', &
+          minval(dataPtr_wavhs), maxval(dataPtr_wavhs), sum(dataPtr_wavhs), size(dataPtr_wavhs)
+       call ESMF_LogWrite(trim(info), ESMF_LOGMSG_INFO)
         
-      !-----------------------------------------
-      ! <<<<< RECEIVE and UN-PACK WAVLEN
-      call State_getFldPtr(ST=importState,fldname='wavlen',fldptr=dataPtr_wavlen,rc=rc)
-      if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
-        line=__LINE__, &
-        file=__FILE__)) &
-        return  ! bail out
+       ! Wave length
+       call State_getFldPtr(ST=importState,fldname='wavlen',fldptr=dataPtr_wavlen,rc=rc)
+       if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
+          line=__LINE__, &
+          file=__FILE__)) &
+          return  ! bail out
 
-      !-----------------------------------------
-      ! <<<<< RECEIVE and UN-PACK WAVDIR
-      call State_getFldPtr(ST=importState,fldname='wavdir',fldptr=dataPtr_wavdir,rc=rc)
-      if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
-        line=__LINE__, &
-        file=__FILE__)) &
-        return  ! bail out
+       write(info,'(A,3g14.7,i8)') trim(subname)//' import wavlen ', &
+          minval(dataPtr_wavlen), maxval(dataPtr_wavlen), sum(dataPtr_wavlen), size(dataPtr_wavlen)
+       call ESMF_LogWrite(trim(info), ESMF_LOGMSG_INFO)
 
-!JQI        write(800+myid,*) size(dataPtr_sxx2)
-!JQI        do i1=1,mdataOut%NumOwnedNd_NOHALO
- !JQI         write(800+myid,*) i1, mdataOut%owned_to_present_nodes(i1),dataPtr_sxx2(i1)
-!JQI	end do  
+       ! Wave direction
+       call State_getFldPtr(ST=importState,fldname='wavdir',fldptr=dataPtr_wavdir,rc=rc)
+       if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
+          line=__LINE__, &
+          file=__FILE__)) &
+          return  ! bail out
 
-      !print *, 'size dataPtr_sxy > ', size(dataPtr_sxy)
-      !print *, 'in cap maxval(RSNX2)', maxval(RSNX2)
-      !print *, 'in cap maxval(RSNY2)', maxval(RSNY2)
-      ! Allocate arrays for radiation stresses.
+       write(info,'(A,3g14.7,i8)') trim(subname)//' import wavdir ', &
+          minval(dataPtr_wavdir), maxval(dataPtr_wavdir), sum(dataPtr_wavdir), size(dataPtr_wavdir)
+       call ESMF_LogWrite(trim(info), ESMF_LOGMSG_INFO)
 
-      IF(.NOT.ALLOCATED(FVCOM_WHS))  ALLOCATE(FVCOM_WHS(0:MT,1:2))
-      IF(.NOT.ALLOCATED(FVCOM_WLEN)) ALLOCATE(FVCOM_WLEN(0:MT,1:2))
-      IF(.NOT.ALLOCATED(FVCOM_WDIR)) ALLOCATE(FVCOM_WDIR(0:MT,1:2))
-      FVCOM_WHS  = 0.0 
-      FVCOM_WLEN = 0.0
-      FVCOM_WDIR = 0.0
+       ! Fill internal data arrays
+       if (par) then
+          ! Allocate temporary arrays
+          if (.not. allocated(tmp_whs )) allocate(tmp_whs (0:ngl))
+          if (.not. allocated(tmp_wlen)) allocate(tmp_wlen(0:ngl))
+          if (.not. allocated(tmp_wdir)) allocate(tmp_wdir(0:ngl))
+          tmp_whs (:) = missing_sp
+          tmp_wlen(:) = missing_sp
+          tmp_wdir(:) = missing_sp
 
-      ! update last rad str
-      FVCOM_WHS(:,1)  = FVCOM_WHS(:,2)
-      FVCOM_WLEN(:,1) = FVCOM_WLEN(:,2)
-      FVCOM_WDIR(:,1) = FVCOM_WDIR(:,2)
+          if (.not. allocated(tmp1_whs )) allocate(tmp1_whs (0:nt))
+          if (.not. allocated(tmp1_wlen)) allocate(tmp1_wlen(0:nt))
+          if (.not. allocated(tmp1_wdir)) allocate(tmp1_wdir(0:nt))
+          tmp1_whs(:)    = missing_sp
+          tmp1_whs(1:n)  = dataptr_wavhs (1:n)
+          tmp1_wlen(:)   = missing_sp
+          tmp1_wlen(1:n) = dataptr_wavlen(1:n)
+          tmp1_wdir(:)   = missing_sp
+          tmp1_wdir(1:n) = dataptr_wavdir(1:n)
 
-      ! Fill owned nodes from imported data to model variable
-      ! devide by water density to convert from N.m-2 to m2s-2
+          ! Collect data from processors
+          call acollect(myid, msrid, nprocs, emap, tmp1_whs , tmp_whs )
+          call acollect(myid, msrid, nprocs, emap, tmp1_wlen, tmp_wdir)
+          call acollect(myid, msrid, nprocs, emap, tmp1_wdir, tmp_wlen)
 
-!      print*, "SIZE =",size(dataPtr_sxx2),mdataIn%NumOwnedNd_NoHalo,  &
-!                                          mdataIn%NumOwnedNd_Halo
+          ! Send the entire array to everyone
+          call mpi_bcast(tmp_whs , (ngl+1), mpi_f, 0, mpi_fvcom_group, ierr)
+          call mpi_bcast(tmp_wlen, (ngl+1), mpi_f, 0, mpi_fvcom_group, ierr)
+          call mpi_bcast(tmp_wdir, (ngl+1), mpi_f, 0, mpi_fvcom_group, ierr)
 
-      do i1 = 1, mdataIn%NumOwnedNd_NoHalo
-        FVCOM_WHS(mdataIn%owned_to_present_nodes(i1),1)  = dataPtr_wavhs(i1)
-        FVCOM_WLEN(mdataIn%owned_to_present_nodes(i1),1) = dataPtr_wavlen(i1)
-        FVCOM_WDIR(mdataIn%owned_to_present_nodes(i1),1) = dataPtr_wavdir(i1)
-      end do
-      do i1 = 1, mdataIn%NumOwnedNd_Halo
-        FVCOM_WHS(mdataIn%owned_to_present_halo_nodes(i1),1)  = dataPtr_wavhs(i1+mdataIn%NumOwnedNd_NoHalo)
-        FVCOM_WLEN(mdataIn%owned_to_present_halo_nodes(i1),1) = dataPtr_wavlen(i1+mdataIn%NumOwnedNd_NoHalo)
-        FVCOM_WDIR(mdataIn%owned_to_present_halo_nodes(i1),1) = dataPtr_wavdir(i1+mdataIn%NumOwnedNd_NoHalo)
-      end do
+          ! Mask data and fix range
+          ! TODO: Check this is actually needed or not
+          where(abs(tmp_whs)  .gt. 1e6) tmp_whs  = 1e-10
+          where(abs(tmp_wlen) .gt. 1e6) tmp_wlen = 1e-10
+          where(abs(tmp_wdir) .gt. 1e6) tmp_wdir = 1e-10
 
-      IF(PAR)THEN
-!        CALL NODE_MATCH(1,NBN,BN_MLT,BN_LOC,BNC,MT,1,MYID,NPROCS,    &
-!                   FVCOM_SXX2(:,1),FVCOM_SYY2(:,1))
-       
-        IF(.NOT. ALLOCATED(TMP_WHS))  ALLOCATE(TMP_WHS(0:MGL))
-        IF(.NOT. ALLOCATED(TMP_WLEN)) ALLOCATE(TMP_WLEN(0:MGL))
-        IF(.NOT. ALLOCATED(TMP_WDIR)) ALLOCATE(TMP_WDIR(0:MGL))
-        IF(.NOT. ALLOCATED(TMP1_WHS)) ALLOCATE(TMP1_WHS(0:MT))
-        IF(.NOT. ALLOCATED(TMP1_WLEN)) ALLOCATE(TMP1_WLEN(0:MT))
-        IF(.NOT. ALLOCATED(TMP1_WDIR)) ALLOCATE(TMP1_WDIR(0:MT))
+          where(tmp_whs  >  1e3) tmp_whs  =  1e3
+          where(tmp_wlen >  1e3) tmp_wlen =  1e3
+          where(tmp_wdir >  1e3) tmp_wdir =  1e3
+          where(tmp_whs  < -1e3) tmp_whs  = -1e3
+          where(tmp_wlen < -1e3) tmp_wlen = -1e3
+          where(tmp_wdir < -1e3) tmp_wdir = -1e3
 
-        TMP1_WHS(:)  = FVCOM_WHS(:,1)
-        TMP1_WLEN(:) = FVCOM_WLEN(:,1)
-        TMP1_WDIR(:) = FVCOM_WDIR(:,1)
+          ! Fill internal data structures that is used by the model
+          do i1 = 1, nt
+             whs (i1) = tmp_whs (egid_x(i1))
+             wlen(i1) = tmp_wlen(egid_x(i1))
+             wdir(i1) = tmp_wdir(egid_x(i1))
+          end do
+       end if
 
-        CALL ACOLLECT(MYID,MSRID,NPROCS,NMAP,TMP1_WHS,TMP_WHS)
-        CALL ACOLLECT(MYID,MSRID,NPROCS,NMAP,TMP1_WLEN,TMP_WLEN)
-        CALL ACOLLECT(MYID,MSRID,NPROCS,NMAP,TMP1_WDIR,TMP_WDIR)
-
-        CALL MPI_BCAST(TMP_WHS,MGL,MPI_F,0,MPI_FVCOM_GROUP,IERR)
-        CALL MPI_BCAST(TMP_WLEN,MGL,MPI_F,0,MPI_FVCOM_GROUP,IERR)
-        CALL MPI_BCAST(TMP_WDIR,MGL,MPI_F,0,MPI_FVCOM_GROUP,IERR)
-
-        do i1 = 1, mt
-        FVCOM_WHS(i1,1)    = TMP_WHS(NGID_X(i1))
-        FVCOM_WLEN(i1,1)   = TMP_WLEN(NGID_X(i1))
-        FVCOM_WDIR(i1,1)   = TMP_WDIR(NGID_X(i1))
-        end do
-
-       ! DEALLOCATE(TMP_SXX2,TMP_SYY2)
-       ! DEALLOCATE(TMP1_SXX2,TMP1_SYY2)
-      END IF
-      FVCOM_WHS(:,2)  = FVCOM_WHS(:,1)
-      FVCOM_WLEN(:,2) = FVCOM_WLEN(:,1)
-      FVCOM_WDIR(:,2) = FVCOM_WDIR(:,1)
-
-      !print *, 'Hard Coded >>>>>  SXX >>>>>> '
-      !mask
-      where(abs(FVCOM_WHS) .gt. 1e6)  FVCOM_WHS  =  1e-10
-      where(abs(FVCOM_WLEN).gt. 1e6)  FVCOM_WLEN =  1e-10
-      where(abs(FVCOM_WDIR).gt. 1e6)  FVCOM_WDIR =  1e-10
-
-      !max values
-      where(FVCOM_WHS  >  1e3)  FVCOM_WHS  =  1e3
-      where(FVCOM_WLEN >  1e3)  FVCOM_WLEN =  1e3
-      where(FVCOM_WDIR >  1e3)  FVCOM_WDIR =  1e3
-      where(FVCOM_WHS  < -1e3)  FVCOM_WHS  = -1e3
-      where(FVCOM_WLEN < -1e3)  FVCOM_WLEN = -1e3
-      where(FVCOM_WDIR < -1e3)  FVCOM_WDIR = -1e3
-
-      if(.not.allocated(whs))  allocate(whs(0:MT))
-      if(.not.allocated(wlen)) allocate(wlen(0:MT))
-      if(.not.allocated(wdir)) allocate(wdir(0:MT))
-
-      whs(0:MT)  = FVCOM_WHS(0:MT,1)
-      wlen(0:MT) = FVCOM_WLEN(0:MT,1)
-      wdir(0:MT) = FVCOM_WDIR(0:MT,1)
-
-      call radiation_stress(whs,wlen,wdir)
-
-        CALL ACOLLECT(MYID,MSRID,NPROCS,NMAP,WHS,TMP_WHS)
-        CALL ACOLLECT(MYID,MSRID,NPROCS,NMAP,WLEN,TMP_WLEN)
-        CALL ACOLLECT(MYID,MSRID,NPROCS,NMAP,WDIR,TMP_WDIR)
-
-!      do i1=1,mgl
-!        write(100+myid,*) i1,tmp_whs(i1)
-!      end do
-!      do i1=1,mgl
-!        write(200+myid,*) i1,tmp_wlen(i1)
-!      end do
-!      do i1=1,mgl
-!        write(300+myid,*) i1,tmp_wdir(i1)
-!      end do
-
-
-!JQI!    NOTE: FVCOM accepts wave-driven stresses "in units of velocity squared
-!JQI!    (consistent with the units of gravity).  Stress in these units is obtained
-!JQI!    by dividing stress in units of force/area by the reference density of water."
-
-
-!
-!
-!From WW3 source : w3iogomd.ftn  line: 1756
-!constants.ftn:34:!      DWAT      Real  Global   Density of water               (kg/m3)
-!constants.ftn:63:      REAL, PARAMETER         :: DWAT   = 1000.
-!
-!w3iogomd.ftn:1753:      SXX    = SXX * DWAT * GRAV
-!w3iogomd.ftn:1754:      SYY    = SYY * DWAT * GRAV
-!w3iogomd.ftn:1755:      SXY    = SXY * DWAT * GRAV
-!
-!    Rad.Str info from netcdf header
-!		 sxx:long_name = "Radiation stress component Sxx" ;
-!		 sxx:standard_name = "radiation_stress_component_sxx" ;
-!		 sxx:globwave_name = "significant_wave_height" ;
-!		 sxx:units = "N m-1" ;
-!		 sxx:_FillValue = 9.96921e+36f ;
-!		 sxx:scale_factor = 1.f ;
-!		 sxx:add_offset = 0.f ;
-!		 sxx:valid_min = -3000 ;
-!	 	 sxx:valid_max = 3000 ;
- 
-!    Therefore we need to divide sxx/rho to change its unit to m3s-2
-!    in force calculation we do d(sxx)/dx therefore the final force 
-!    unit will be m2s-2 which is the correct one.   
-
-      !print *, 'in cap maxval(FVCOM_SXX)', maxval(FVCOM_SXX)
-
-!JQI        InterpoWeight = 0.0  !avoid time interpolation
-
-      ! Calculate wave forces
-!JQI        call ComputeWaveDrivenForces
-
-      !iunit_log = iunit_log + 1
-      !open(unit = iunit_log, ACTION = "write", STATUS ="replace" )
-      !write(iunit_log, *) RSNX2, RSNY2
-      !close(iunit_log)
-
-!JQI        write(info,*) subname,' --- wave data exchange OK / wave feilds are all connected --- / Model advances '
-!JQI        call ESMF_LogWrite(info, ESMF_LOGMSG_INFO, rc=dbrc)
-      !print *, info
-
-      !RSNX2 = 0.0001
-      !RSNY2 = 0.0001
-    
-      !RSNX2 = 0.0
-      !RSNY2 = 0.0
-
-      ! initialize time reach to Caribean Islands
-      !call ESMF_TimeSet(BeforeCaribbeanTime, yy=2008, mm=9, dd=6 , h=12, m=0, s=0, rc=rc)
-      !call ESMF_TimeSet(AfterCaribbeanTime , yy=2008, mm=9, dd=12, h=12, m=0, s=0, rc=rc)
-
-!!!!#ifdef NO_COMPILE00000
-        !-----------------------
-   !     if ((currTime > BeforeCaribbeanTime) .and. (currTime < AfterCaribbeanTime)) then
-!JQI            write(info,*) subname, 'in cap after maxval(RSNX2)', maxval(RSNX2)
-!JQI            call ESMF_LogWrite(info, ESMF_LOGMSG_INFO, rc=dbrc)
-
-!JQI            write(info,*) subname, 'in cap after maxval(RSNY2)', maxval(RSNY2)
-!JQI            call ESMF_LogWrite(info, ESMF_LOGMSG_INFO, rc=dbrc)
-
-            !print *, 'Hard Coded >>>>>>>>>>>  where(abs(RSNX2).gt. wave_force_limmit) RSNX2 =  wave_force_limmit'
-            !write(info,*) subname,'Hard Coded >>>>>>>>>>>  where(abs(RSNX2).gt. wave_force_limmit) RSNX2 =  wave_force_limmit'
-            !call ESMF_LogWrite(info, ESMF_LOGMSG_INFO, rc=dbrc)
-
-            !where(RSNX2.gt. wave_force_limmit) RSNX2 =  wave_force_limmit
-            !where(RSNY2.gt. wave_force_limmit) RSNY2 =  wave_force_limmit
-
-            !where(RSNX2.le. (-1.0 * wave_force_limmit)) RSNX2 =  -1.0 * wave_force_limmit
-            !where(RSNY2.le. (-1.0 * wave_force_limmit)) RSNY2 =  -1.0 * wave_force_limmit
-
-!!!!#endif
-
-    !        endif
-
+       ! Compute wave related properties
+       call radiation_stress(whs,wlen,wdir)
     else
-      NUOPC4WAV = .false.
-      write(info,*) subname,' --- no wave forcing exchange / waves are not all connected --- '
-      call ESMF_LogWrite(info, ESMF_LOGMSG_INFO, rc=dbrc)
-      !print *, info
-      !stop
+       nuopc4wav = .false.
+       write(info,*) subname,' --- no wave forcing exchange / waves are not all connected --- '
+       call ESMF_LogWrite(info, ESMF_LOGMSG_INFO, rc=dbrc)
     end if        
+
     !-----------------------------------------
-    !   IMPORT from ATM
+    ! Import from ATM
     !-----------------------------------------
+
+    ! Check for import fields
     meteo_forcing= .true.
     do num = 1,fldsToFvcom_num
       if (fldsToFvcom(num)%shortname == 'pmsl')    meteo_forcing = meteo_forcing .and. fldsToFvcom(num)%connected
@@ -1290,240 +1113,87 @@ module fvcom_cap
       if (fldsToFvcom(num)%shortname == 'izwh10m') meteo_forcing = meteo_forcing .and. fldsToFvcom(num)%connected
     end do
     
-    if ( meteo_forcing) then
-!JQI        !NWS = 39   ! over write NWS option to be sure we incldue wind forcing
-        
-!JQI        !WTIMINC = wrf_int 
-!JQI        !WTIMINC = wrf_int +  wrf_num / wrf_den
-!JQI        WTIMINC =  nint(timeStepAbs)  !TODO: Get it from coupler based on the time slots.
-                                      !TODO: This implemetation wotks for one time slot for wind and wave right now.
-                                      !TODO: 
-        !Get and fill imported fields
-        ! <<<<< RECEIVE and UN-PACK pmsl
-!JQI        call State_getFldPtr_(ST=importState,fldname='pmsl',fldptr=dataPtr_pres,dump=.true.,timeStr=timeStr,rc=rc)
-        call State_getFldPtr(ST=importState,fldname='pmsl',fldptr=dataPtr_pres,rc=rc)
-        if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
+    !Get and fill imported forcing fields
+    if (meteo_forcing) then
+       ! Mean sea level pressure
+       call State_getFldPtr(ST=importState,fldname='pmsl',fldptr=dataPtr_pres,rc=rc)
+       if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
           line=__LINE__, &
           file=__FILE__)) &
           return  ! bail out
 
-        !print *, 'size > 5 dataPtr_pmsl>', size(dataPtr_pmsl) !, dataPtr_pmsl(5:)
-        
-        !-----------------------------------------
-        ! <<<<< RECEIVE and UN-PACK imwh10m    V-Y wind comp
-!JQI        call State_getFldPtr_(ST=importState,fldname='imwh10m',fldptr=dataPtr_imwh10m,rc=rc,dump=.false.,timeStr=timeStr)
-        call State_getFldPtr(ST=importState,fldname='imwh10m',fldptr=dataPtr_vwnd,rc=rc)
-        if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
+       write(info,'(A,3g14.7,i8)') trim(subname)//' import pmsl ', &
+          minval(dataPtr_pres), maxval(dataPtr_pres), sum(dataPtr_pres), size(dataPtr_pres)
+       call ESMF_LogWrite(trim(info), ESMF_LOGMSG_INFO)
+
+       ! Meridional wind
+       call State_getFldPtr(ST=importState,fldname='imwh10m',fldptr=dataPtr_vwnd,rc=rc)
+       if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
           line=__LINE__, &
           file=__FILE__)) &
           return  ! bail out
-        print*, 'vwnd min,max = ', minval(dataPtr_vwnd), maxval(dataPtr_vwnd)
-        !-----------------------------------------
-        ! <<<<< RECEIVE and UN-PACK izwh10m    U-X  wind comp
-!JQI        call State_getFldPtr_(ST=importState,fldname='izwh10m',fldptr=dataPtr_izwh10m,rc=rc,dump=.false.,timeStr=timeStr)
-        call State_getFldPtr(ST=importState,fldname='izwh10m',fldptr=dataPtr_uwnd,rc=rc)
-        if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
+
+       write(info,'(A,3g14.7,i8)') trim(subname)//' import imwh10m ', &
+          minval(dataPtr_vwnd), maxval(dataPtr_vwnd), sum(dataPtr_vwnd), size(dataPtr_vwnd)
+       call ESMF_LogWrite(trim(info), ESMF_LOGMSG_INFO)
+
+       ! Zonal wind
+       call State_getFldPtr(ST=importState,fldname='izwh10m',fldptr=dataPtr_uwnd,rc=rc)
+       if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
           line=__LINE__, &
           file=__FILE__)) &
           return  ! bail out
+       write(info,'(A,3g14.7,i8)') trim(subname)//' import izwh10m ', &
+          minval(dataPtr_uwnd), maxval(dataPtr_uwnd), sum(dataPtr_uwnd), size(dataPtr_uwnd)
+       call ESMF_LogWrite(trim(info), ESMF_LOGMSG_INFO)
         
-!JQI        write(info,*) subname,' --- meteo forcing exchange OK / atm feilds are all connected --- / Model advances '
-!JQI        call ESMF_LogWrite(info, ESMF_LOGMSG_INFO, rc=dbrc)
-        !print *, info
+       ! Fill internal data arrays
+       if (par) then
+          ! Allocate temporary arrays
+          if (.not. allocated(tmp_wvnx)) allocate(tmp_wvnx(0:ngl))
+          if (.not. allocated(tmp_wvny)) allocate(tmp_wvny(0:ngl))
+          if (.not. allocated(tmp_prn )) allocate(tmp_prn (0:ngl))
+          tmp_wvnx(:) = missing_sp
+          tmp_wvny(:) = missing_sp
+          tmp_prn (:) = missing_sp
 
-        ! Allocate arrays for radiation stresses.
-        IF(.NOT.ALLOCATED(FVCOM_WVNX)) ALLOCATE(FVCOM_WVNX(0:MT,1:2))
-        IF(.NOT.ALLOCATED(FVCOM_WVNY)) ALLOCATE(FVCOM_WVNY(0:MT,1:2))
-        IF(.NOT.ALLOCATED(FVCOM_PRN) ) ALLOCATE(FVCOM_PRN (0:MT,1:2))
+          if (.not. allocated(tmp1_wvnx)) allocate(tmp1_wvnx(0:nt))
+          if (.not. allocated(tmp1_wvny)) allocate(tmp1_wvny(0:nt))
+          if (.not. allocated(tmp1_prn )) allocate(tmp1_prn (0:nt))
+          tmp1_wvnx(:)   = missing_sp
+          tmp1_wvnx(1:n) = dataptr_uwnd(1:n)
+          tmp1_wvny(:)   = missing_sp
+          tmp1_wvny(1:n) = dataptr_vwnd(1:n)
+          tmp1_prn(:)    = missing_sp
+          tmp1_prn(1:n)  = dataptr_pres(1:n)
 
-!        IF(.NOT.ALLOCATED(FVCOM_WVNX2)) ALLOCATE(WVNX2(1:NP))
-!        IF(.NOT.ALLOCATED(FVCOM_WVNY2)) ALLOCATE(WVNY2(1:NP))
-!        IF(.NOT.ALLOCATED(PRN2) ) ALLOCATE(PRN2 (1:NP))
+          ! Collect data from processors
+          call acollect(myid, msrid, nprocs, emap, tmp1_wvnx, tmp_wvnx)
+          call acollect(myid, msrid, nprocs, emap, tmp1_wvny, tmp_wvny)
+          call acollect(myid, msrid, nprocs, emap, tmp1_prn , tmp_prn )
 
-        !print *, 'maxval(WVNX2)', maxval(WVNX2)
+          ! Send the entire array to everyone
+          call mpi_bcast(tmp_wvnx, (ngl+1), mpi_f, 0, mpi_fvcom_group, ierr)
+          call mpi_bcast(tmp_wvny, (ngl+1), mpi_f, 0, mpi_fvcom_group, ierr)
+          call mpi_bcast(tmp_prn , (ngl+1), mpi_f, 0, mpi_fvcom_group, ierr)
 
-        FVCOM_WVNX(:,1) = FVCOM_WVNX(:,2)   
-        FVCOM_WVNY(:,1) = FVCOM_WVNY(:,2)  
-        FVCOM_PRN(:,1)  = FVCOM_PRN(:,2)
-
-        !call UPDATER( dataPtr_izwh10m(:), dataPtr_imwh10m(:), dataPtr_pmsl(:),3)
-       
-        ! Fill owned nodes from imported data to model variable
-        !TODO: unit check
-!JQI        do i1 = 1, mdataOut%NumOwnedNd, 1
-!JQI            WVNX2(mdataOut%owned_to_present_nodes(i1)) =  dataPtr_izwh10m(i1) !* 0.0  !zonal is u-comp or x-comp
-!JQI        end do
-
-!JQI        do i1 = 1, mdataOut%NumOwnedNd, 1
-!JQI            WVNY2(mdataOut%owned_to_present_nodes(i1)) =  dataPtr_imwh10m(i1) !* 0.0  !Meridionalis v-comp or y-comp
-!JQI        end do
-        
-!JQI        do i1 = 1, mdataOut%NumOwnedNd, 1
-!JQI            PRN2(mdataOut%owned_to_present_nodes(i1) ) = dataPtr_pmsl(i1) / (1025 * 9.81)    !convert Pascal to mH2O
-        
-        do i1 = 1, mdataIn%NumOwnedNd_NoHalo, 1
-           FVCOM_WVNX(mdataIn%owned_to_present_nodes(i1),2) =  dataPtr_uwnd(i1) !* 0.0  !zonal is u-comp or x-comp
-           FVCOM_WVNY(mdataIn%owned_to_present_nodes(i1),2) =  dataPtr_vwnd(i1) !* 0.0  !Meridionalis v-comp or y-comp
-           FVCOM_PRN(mdataIn%owned_to_present_nodes(i1),2 ) =  dataPtr_pres(i1) / (1025 * 9.81)    !convert Pascal to mH2O
-        end do
-
-        do i1 = 1, mdataIn%NumOwnedNd_Halo, 1
-           FVCOM_WVNX(mdataIn%owned_to_present_halo_nodes(i1),2) =  dataPtr_uwnd(i1+mdataIn%NumOwnedNd_NoHalo) !* 0.0  !zonal is u-comp or x-comp
-           FVCOM_WVNY(mdataIn%owned_to_present_halo_nodes(i1),2) =  dataPtr_vwnd(i1+mdataIn%NumOwnedNd_NoHalo) !* 0.0  !Meridionalis v-comp or y-comp
-           FVCOM_PRN(mdataIn%owned_to_present_halo_nodes(i1),2 ) =  dataPtr_pres(i1+mdataIn%NumOwnedNd_NoHalo) / (1025 * 9.81)    !convert Pascal to mH2O
-        end do
-
-      IF(PAR)THEN
-       
-        IF(.NOT. ALLOCATED(TMP_WVNX)) ALLOCATE(TMP_WVNX(0:MGL))
-        IF(.NOT. ALLOCATED(TMP_WVNY)) ALLOCATE(TMP_WVNY(0:MGL))
-        IF(.NOT. ALLOCATED(TMP_PRN )) ALLOCATE(TMP_PRN(0:MGL))
-        IF(.NOT. ALLOCATED(TMP1_WVNX)) ALLOCATE(TMP1_WVNX(0:MT))
-        IF(.NOT. ALLOCATED(TMP1_WVNY)) ALLOCATE(TMP1_WVNY(0:MT))
-        IF(.NOT. ALLOCATED(TMP1_PRN)) ALLOCATE(TMP1_PRN(0:MT))
-
-        TMP1_WVNX(:) = FVCOM_WVNX(:,2)
-        TMP1_WVNY(:) = FVCOM_WVNY(:,2)
-        TMP1_PRN (:) = FVCOM_PRN (:,2)
-
-        CALL ACOLLECT(MYID,MSRID,NPROCS,NMAP,TMP1_WVNX,TMP_WVNX)
-        CALL ACOLLECT(MYID,MSRID,NPROCS,NMAP,TMP1_WVNY,TMP_WVNY)
-        CALL ACOLLECT(MYID,MSRID,NPROCS,NMAP,TMP1_PRN,TMP_PRN)
-
-        CALL MPI_BCAST(TMP_WVNX,MGL,MPI_F,0,MPI_FVCOM_GROUP,IERR)
-        CALL MPI_BCAST(TMP_WVNY,MGL,MPI_F,0,MPI_FVCOM_GROUP,IERR)
-        CALL MPI_BCAST(TMP_PRN ,MGL,MPI_F,0,MPI_FVCOM_GROUP,IERR)
-
-        do i1 = 1, mt
-         FVCOM_WVNX(i1,2)   = TMP_WVNX(NGID_X(i1))
-         FVCOM_WVNY(i1,2)   = TMP_WVNY(NGID_X(i1))
-         FVCOM_PRN (i1,2)   = TMP_PRN (NGID_X(i1))
-        end do
-
-       ! DEALLOCATE(TMP_SXX2,TMP_SYY2)
-       ! DEALLOCATE(TMP1_SXX2,TMP1_SYY2)
-      END IF
-          !if ( abs(dataPtr_pmsl(i1) ).gt. 1e11)  then
-          !  STOP '  dataPtr_pmsl > mask '     
-          !end if
-!JQI        end do
-         
-        ! Ghost nodes update 
-!JQI        call UPDATER( WVNX1(:), WVNY1(:), PRN1(:),3)
-!JQI        call UPDATER( WVNX2(:), WVNY2(:), PRN2(:),3)
-
-!JQI        if (first_exchange .and. sum(PRN1) .le. 1.0) then
-!JQI          WVNX2 = 1e-10
-!JQI          WVNY2 = 1e-10
-!JQI          WVNX1 = 1e-10
-!JQI          WVNY1 = 1e-10
-
-!JQI          PRN2 = 10.0  !hard coded to handel the 1st exchange zeros problem :TODO! Need to resolve this!
-!JQI          PRN1 = PRN2
-!JQI          first_exchange = .false.
-!JQI        end if  
-    
-        !if (sum(PRN1) .eq. 0.0 ) then
-        !  PRN1 = 10000.0
-        !end if  
-    
-        !if (sum(WVNX2) .eq. 0.0 ) then
-        !  WVNX2 = 8.0
-        !end if  
-    
-        !if (sum(WVNX1) .eq. 0.0 ) then
-        !  WVNX1 = 8.0
-        !end if  
-        
-
-        !if (sum(WVNY2) .eq. 0.0 ) then
-        !  WVNY2 = -8.0
-        !end if  
-    
-        !if (sum(WVNY1) .eq. 0.0 ) then
-        !  WVNY1 = -8.0
-        !end if  
-
-
-        !where(abs(PRN1).gt. 1e11)  PRN1 =  1e4
-        !where(abs(PRN2).gt. 1e11)  PRN2 =  1e4
-
-        
-        ! where(abs(WVNX1).gt. 1e6)  WVNX1 =  8.0
-        !where(abs(WVNX2).gt. 1e6)  WVNX2 =  8.0
-
-        !where(abs(WVNY1).gt. 1e6)  WVNY1 =  -8.0
-        !where(abs(WVNY2).gt. 1e6)  WVNY2 =  -8.0
-
-            
-          !PRN2 = 10000.0
-          !PRN1 = 10000.0
-          !WVNX2 =  8.0
-          !WVNX1 =  8.0
-          !WVNY2 = -8.0
-          !WVNY1 = -8.0       
-            
-    
-        !where(dataPtr_pmsl .gt. 1e20)  dataPtr_pmsl =  10e4
-        !where(dataPtr_pmsl .lt. 8e4 )  dataPtr_pmsl =  10e4        
-        
-        !print *, 'size(dataPtr_pmsl) > ',  size(dataPtr_pmsl)
-        !print *, 'size(PRN2)         > ',  size(PRN2)
-
-
-        !
-        !where((WVNX2).gt. 20)  WVNX2 =  20
-        !where((WVNY2).gt. 20)  WVNY2 =  20
-        !where((PRN2) .gt. 1e20)   PRN2 =  1e4                
-
-        !where((WVNX1).gt. 20)  WVNX1 =  20
-        !where((WVNY1).gt. 20)  WVNY1 =  20
-        !where((PRN1).gt.  1e20)   PRN1 =  1e4  
-        
-        !PRN1 =  1e4  
-        !PRN2 =  1e4  
-        
-        ! Ghost nodes update for meteo infos
-        !call UPDATER( WVNX2(:), WVNY2(:), PRN2(:),3)
-
-        !print *, 'in cap before maxval(WVNX2)', maxval(WVNX2)
-        !print *, 'in cap before maxval(WVNY2)', maxval(WVNY2)
-         !WVNX2 = 10.0
-         !WVNY2 = 10.0
-         !PRN2  = 10000.0
-
-         !WVNX2 = 0.0
-         !WVNY2 = 0.0
-         !PRN2  = 10000.0
-
-        !print *, 'in cap after maxval(WVNX2)', maxval(WVNX2)
-        !print *, 'in cap after maxval(WVNY2)', maxval(WVNY2)    
-
-
-      DO I1=1,NT
-          UUWIND(I1)  = (FVCOM_WVNX(NV(I1,1),2)+FVCOM_WVNX(NV(I1,2),2)+FVCOM_WVNX(NV(I1,3),2))/3.0_SP
-          VVWIND(I1)  = (FVCOM_WVNY(NV(I1,1),2)+FVCOM_WVNY(NV(I1,2),2)+FVCOM_WVNY(NV(I1,3),2))/3.0_SP
-      END DO	  
-
+          ! Fill internal data structures that is used by the model
+          do i1 = 1, nt
+             uuwind(i1) = tmp_wvnx(egid_x(i1))
+             vvwind(i1) = tmp_wvny(egid_x(i1))
+          end do
+# if defined (AIR_PRESSURE) || (HEATING_CALCULATED)
+          ! Fill with the average of surrounding elements
+          call e2n2d(tmp_prn, pa_air)
+# endif
+       end if
     else
-        NUOPC4MET = .false.
-        write(info,*) subname,' --- no meteo forcing exchange / atm feilds are not all connected --- '
-        call ESMF_LogWrite(info, ESMF_LOGMSG_INFO, rc=dbrc)
-        !print *, info
-        !stop
+       nuopc4met = .false.
+       write(info,*) subname,' --- no meteo forcing exchange / atm feilds are not all connected --- '
+       call ESMF_LogWrite(info, ESMF_LOGMSG_INFO, rc=dbrc)
     endif
 
-    surge_forcing= .true.
-    do num = 1,fldsFrFvcom_num
-      if (fldsFrFvcom(num)%shortname == 'seahgt') &
-          surge_forcing = surge_forcing .and. fldsFrFvcom(num)%connected
-      if (fldsFrFvcom(num)%shortname == 'uucurr') &
-          surge_forcing = surge_forcing .and. fldsFrFvcom(num)%connected
-      if (fldsFrFvcom(num)%shortname == 'vvcurr') &
-          surge_forcing = surge_forcing .and. fldsFrFvcom(num)%connected
-    end do
-
-    ! dump import state
+    ! dump import state into VTK file
     if (dbug) then
        call StateWriteVTK(importState, 'state_imp_'//trim(timeStr), rc=rc)
        if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, &
@@ -1532,20 +1202,23 @@ module fvcom_cap
          return  ! bail out
     end if
 
-    !------------------------------------------
-    !---------------  RUN  --------------------
-    !------------------------------------------
-    write(info,*) subname,' --- run phase 2 called --- '
-    !print *,      subname,' --- run phase 2 called --- '
-    call ESMF_LogWrite(info, ESMF_LOGMSG_INFO, rc=dbrc)
+    !-----------------------------------------
+    ! Run model
+    !-----------------------------------------
 
     call NUOPC_FVCOM_Run(nCplFVCOM)
 
-    write(info,*) subname,' --- run phase 3 called --- '         ! nCplFVCOM = ',nCplFVCOM
-    call ESMF_LogWrite(info, ESMF_LOGMSG_INFO, rc=dbrc)
-    !-------------------------------------------
+    !-----------------------------------------
+    ! Export to other components
+    !-----------------------------------------
 
-!    surge_forcing = .true.
+    ! Check for export fields
+    surge_forcing= .true.
+    do num = 1,fldsFrFvcom_num
+       if (fldsFrFvcom(num)%shortname == 'seahgt') surge_forcing = surge_forcing .and. fldsFrFvcom(num)%connected
+       if (fldsFrFvcom(num)%shortname == 'uucurr') surge_forcing = surge_forcing .and. fldsFrFvcom(num)%connected
+       if (fldsFrFvcom(num)%shortname == 'vvcurr') surge_forcing = surge_forcing .and. fldsFrFvcom(num)%connected
+    end do
 
     if (surge_forcing) then
     
